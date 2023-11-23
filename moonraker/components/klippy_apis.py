@@ -7,6 +7,11 @@
 from __future__ import annotations
 from ..utils import Sentinel
 from ..common import WebRequest, Subscribable
+import logging
+import time
+import asyncio
+import configparser
+from collections import deque
 
 # Annotation imports
 from typing import (
@@ -66,6 +71,13 @@ class KlippyAPI(Subscribable):
         self.server.register_event_handler(
             "server:klippy_disconnect", self._on_klippy_disconnect
         )
+        #diy start print
+        self.up_z = 10
+        self.fan_set_c = 100
+        self.wait_for_sensor_ready = 40
+        self.e_tempe_to_cool = 140
+        self.b_tempe_to_cool = 40
+        self.init_conf()
 
     def _on_klippy_disconnect(self) -> None:
         self.host_subscription.clear()
@@ -123,6 +135,89 @@ class KlippyAPI(Subscribable):
         # Doing so will result in "wait_started" blocking for the specifed
         # timeout (default 20s) and returning False.
         # XXX - validate that file is on disk
+        self.last_temps: Dict[str, Tuple[float, ...]] = {}
+        self.temperature_store: TempStore = {}
+        self.temp_store_size = 1200
+        self.heater_bed_temp = 0.0
+        self.extruder_temp = 0.0
+        try:
+            result: Dict[str, Any]
+            result = await self.query_objects({'heaters': None})
+        except self.server.error as e:
+            logging.info(f"Error Configuring Sensors: {e}")
+            return
+        sensors: List[str]
+        sensors = result.get("heaters", {}).get("available_sensors", [])
+        if sensors:
+            # Add Subscription
+            sub: Dict[str, Optional[List[str]]] = {s: None for s in sensors}
+            try:
+                status: Dict[str, Any]
+                status = await self.subscribe_objects(sub)
+            except self.server.error as e:
+                logging.info(f"Error subscribing to sensors: {e}")
+                return
+            logging.info(f"Configuring available sensors: {sensors}")
+            new_store: TempStore = {}
+            for sensor in sensors:
+                fields = list(status.get(sensor, {}).keys())
+                if sensor in self.temperature_store:
+                    new_store[sensor] = self.temperature_store[sensor]
+                else:
+                    new_store[sensor] = {
+                        'temperatures': deque(maxlen=self.temp_store_size)}
+                    for item in ["target", "power", "speed"]:
+                        if item in fields:
+                            new_store[sensor][f"{item}s"] = deque(
+                                maxlen=self.temp_store_size)
+                if sensor not in self.last_temps:
+                    self.last_temps[sensor] = (0., 0., 0., 0.)
+            self.temperature_store = new_store
+            # Prune unconfigured sensors in self.last_temps
+            for sensor in list(self.last_temps.keys()):
+                if sensor not in self.temperature_store:
+                    del self.last_temps[sensor]
+            # Update initial temperatures
+            for sensor in self.temperature_store:
+                if sensor in status:
+                    last_val = self.last_temps[sensor]
+                    self.last_temps[sensor] = (
+                        round(status[sensor].get('temperature', last_val[0]), 2),
+                        status[sensor].get('target', last_val[1]),
+                        status[sensor].get('power', last_val[2]),
+                        status[sensor].get('speed', last_val[3]))
+                    if sensor == 'heater_bed':
+                        self.heater_bed_temp = round(status[sensor].get('temperature', last_val[0]), 2)
+                        logging.info("\033[7m\033[5m" + "self.last_temps[sensor]" + "\033[0m")
+                        logging.info(sensor)
+                        logging.info(self.last_temps[sensor])
+                    if sensor == 'extruder':
+                        self.extruder_temp = round(status[sensor].get('temperature', last_val[0]), 2)
+                        logging.info("\033[7m\033[5m" + "self.last_temps[sensor]" + "\033[0m")
+                        logging.info(sensor)
+                        logging.info(self.last_temps[sensor])
+        else:
+            logging.info("No sensors found")
+            self.last_temps = {}
+            self.temperature_store = {}
+
+        logging.info("\033[7m\033[5m" + "debug info" + "\033[0m")
+        up_z_script = f'G1 Z{self.up_z} F600'
+        await self.run_gcode('G28')
+        await self.run_gcode(up_z_script)
+        if self.extruder_temp >= self.e_tempe_to_cool or self.heater_bed_temp >= self.b_tempe_to_cool:
+            self.server.send_event("server:gcode_response", "preparing for print...")
+            fan_set_script = f'M106 S{int(((self.fan_set_c % 101) / 100 * 255) + 0.5)}'
+            logging.info("\033[7m\033[5m" + fan_set_script + "\033[0m")
+            await self.run_gcode(fan_set_script)
+            start_time = time.time()
+            while True:
+                if time.time() - start_time > self.wait_for_sensor_ready:
+                    break
+                logging.info(time.time())
+                time.sleep(1)
+                await asyncio.sleep(1)
+        self.server.send_event("server:gcode_response", "ready to start")
         if filename[0] == '/':
             filename = filename[1:]
         # Escape existing double quotes in the file name
@@ -259,6 +354,25 @@ class KlippyAPI(Subscribable):
         for cb in self.subscription_callbacks:
             self.eventloop.register_callback(cb, status, eventtime)
         self.server.send_event("server:status_update", status)
+
+    def init_conf(self):
+        config = configparser.ConfigParser()
+        conf_ini_path_l = [47, 104, 111, 109, 101, 47, 109, 107, 115, 47, 68, 101, 115, 107, 116, 111, 112, 47, 109, 121, 102, 105, 108, 101, 47, 122, 110, 112, 47, 122, 110, 112, 95, 116, 106, 99, 95, 107, 108, 105, 112, 112, 101, 114, 47, 101, 108, 101, 103, 111, 111, 95, 99, 111, 110, 102, 46, 105, 110, 105]
+        conf_ini_path = "".join(map(chr, conf_ini_path_l))
+        config.read(conf_ini_path)
+
+        logging.info("load level mode conf")
+        if config.has_section("level_mode"):
+            if config.has_option("level_mode", "up_z"):
+                self.up_z = config.getint("level_mode", "up_z")
+            if config.has_option("level_mode", "fan_set_c"):
+                self.fan_set_c = config.getint("level_mode", "fan_set_c")
+            if config.has_option("level_mode", "wait_for_sensor_ready"):
+                self.wait_for_sensor_ready = config.getint("level_mode", "wait_for_sensor_ready")
+            if config.has_option("level_mode", "e_tempe_to_cool"):
+                self.e_tempe_to_cool = config.getint("level_mode", "e_tempe_to_cool")
+            if config.has_option("level_mode", "b_tempe_to_cool"):
+                self.b_tempe_to_cool = config.getint("level_mode", "b_tempe_to_cool")
 
 def load_component(config: ConfigHelper) -> KlippyAPI:
     return KlippyAPI(config)

@@ -104,6 +104,19 @@ def regex_find_max_float(pattern: str, data: str) -> Optional[float]:
     result = regex_find_floats(pattern, data)
     return max(result) if result else None
 
+def _regex_find_string_znp(pattern: str, data: str) -> Optional[str]:
+    last_pattern = ';'+pattern
+    split_datas = data.split("\n")
+    preview_string = ""
+    for split_data in split_datas:
+        if last_pattern in split_data:
+            preview_string += split_data.replace(last_pattern, "")
+        elif pattern in split_data:
+            preview_string += split_data.replace(pattern, "")
+    if preview_string:
+        return preview_string
+    return None
+
 
 # Slicer parsing implementations
 class BaseSlicer(object):
@@ -280,6 +293,14 @@ class BaseSlicer(object):
 
     def parse_nozzle_diameter(self) -> Optional[float]:
         return None
+
+    def parse_gimage(self) -> Optional[str]:
+        return _regex_find_string_znp(
+            r";gimage:", self.header_data)
+
+    def parse_simage(self) -> Optional[str]:
+        return _regex_find_string_znp(
+            r";simage:", self.header_data)
 
 class UnknownSlicer(BaseSlicer):
     def check_identity(self, data: str) -> Optional[Dict[str, str]]:
@@ -921,6 +942,8 @@ SUPPORTED_SLICERS: List[Type[BaseSlicer]] = [
     KISSlicer, IdeaMaker, IceSL, KiriMoto
 ]
 SUPPORTED_DATA = [
+    'gimage',
+    'simage',
     'gcode_start_byte',
     'gcode_end_byte',
     'layer_count',
